@@ -1,0 +1,12 @@
+# Nagrania i ich transkrypcje — nigdy nie commitujemy.
+recordings/
+
+# Konfiguracja lokalna/wdrożeniowa (wzorzec jest w .env.example).
+.env
+
+# Historia wdrożeń prowadzona przez deploy.sh.
+.deploy-history
+
+# Python
+__pycache__/
+*.pyc

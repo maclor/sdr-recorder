@@ -18,17 +18,80 @@ Trzy kontenery Dockera:
 
 ## Uruchomienie
 
+### Lokalnie (budowanie ze źródeł)
+
 ```bash
+cp .env.example .env        # opcjonalnie, można też bez — są wartości domyślne
 docker compose up -d --build
 ```
 
-Strona odsłuchu: `http://<adres-pi>:8074/`
+`docker compose` sam scala `docker-compose.override.yml`, który dokłada `build:`. Plik `docker-compose.yml` pozostaje dokładnie w takiej formie, w jakiej używa go serwer: sam `image:`, bez `build:`.
 
-## Konfiguracja (zmienne w `docker-compose.yml`)
+### Na serwerze (ciągnięcie gotowych obrazów)
+
+Serwer ma własny katalog z tym repozytorium i **własny `.env`** — nigdy nie edytuj `docker-compose.yml` ręcznie:
+
+```bash
+cp .env.example .env
+$EDITOR .env                # ustaw OPENWEBRX_WS_URL, WEB_PORT, THREADS
+chmod +x deploy.sh
+./deploy.sh                 # wdrożenie wersji z .env (domyślnie latest)
+```
+
+Strona odsłuchu: `http://<adres-serwera>:8074/`
+
+## Budowanie i wdrażanie
+
+Obrazy buduje **GitHub Actions** i pcha do **GitHub Container Registry**. Wdrożenie na serwerze jest **ręczne** — `deploy.sh` nigdy nie wdraża sam.
+
+```
+git push  →  Actions (build + push do ghcr.io)  →  ./deploy.sh <tag>  na serwerze
+```
+
+Każdy push na `main` przebudowuje i wypchnie trzy obrazy. Pull request tylko buduje (bez wypychania). Cache warstw trzyma się na GitHubie, więc po pierwszym budowaniu — a głównie po tym kosztownym — kolejne trwają sekundy.
+
+Obrazy dostają dwa tagi:
+
+- `sha-xxxxxxx` — konkretny commit, do wdrażania reprodukowalnego i do rollbacku,
+- `latest` — to, co jest aktualnie na `main`.
+
+Repozytorium jest publiczne, więc obrazy w GHCR też. Serwer ciągnie je anonimowo, **`docker login` nie jest potrzebny** i nie ma żadnych sekretów do skonfigurowania.
+
+### `deploy.sh`
+
+Skrypt stoi po stronie serwera i **nigdy nie wykonuje operacji na gicie** — aktualizację konfiguracji robisz osobno przez `git pull`.
+
+```bash
+./deploy.sh                 # wersja z .env (domyślnie latest)
+./deploy.sh sha-abc1234     # konkretna wersja
+./deploy.sh --rollback      # powrót do poprzednio udanej wersji
+./deploy.sh --list          # historia wdrożeń
+./deploy.sh --status        # co działa teraz
+```
+
+Co się dzieje przy `./deploy.sh <tag>`:
+
+1. `docker compose pull` **zanim** cokolwiek się zmieni — zły obraz nie wywróci działającej usługi.
+2. `docker compose up -d --remove-orphans`.
+3. Health check z realnymi sygnałami, nie tylko z `docker ps`:
+   - wszystkie trzy kontenery `running` i bez restartów,
+   - `web` odpowiada HTTP na porcie z `.env`,
+   - `transcriber` wypisał `using whisper binary` (czyli obraz i model są sprawne).
+4. Nie powiodło się → **automatyczny rollback** na poprzednią wersję, wypis logów i kod wyjścia 1.
+5. Powiodło się → wpis do `.deploy-history`, na końcu polecenie `curl` do sprawdzenia strony.
+
+`recorder` jest sprawdzany osobno i **nie blokuje wdrożenia**: brak `receiver ready:` oznacza najczęściej zły `OPENWEBRX_WS_URL` w `.env`, a rollback obrazu tego nie naprawi, tylko zaburzy diagnostykę. Dostajesz ostrzeżenie, nie błędne wdrożenie.
+
+Powtarzane `--rollback` cofa się coraz dalej wstecz. Historia trzyma 20 ostatnich wersji w `.deploy-history` (plik lokalny, ignorowany przez gita).
+
+## Konfiguracja (zmienne w `.env`)
+
+Wszystko poniżej ustawia się w `.env`, a `docker-compose.yml` czyta to przez `${ZMIENNA:-domyślna}`. Dzięki temu serwer ma własną konfigurację bez edycji plików śledzonych przez gita.
 
 | Zmienna | Domyślnie | Opis |
 |---|---|---|
-| `OPENWEBRX_WS_URL` | `ws://192.168.68.67:8073/ws/` | adres WebSocket OpenWebRX |
+| `IMAGE_TAG` | `latest` | wersja obrazów; `deploy.sh` używa własnej wartości, więc tu nie musisz jej zmieniać |
+| `OPENWEBRX_WS_URL` | `ws://192.168.68.67:8073/ws/` | adres WebSocket OpenWebRX. Gdy OpenWebRX jest na tym samym hoście: `ws://host.docker.internal:8073/ws/` |
 | `FREQUENCIES` | `149287500:nfm` | lista `freq:mod` oddzielona przecinkami (na razie nagrywana jest pierwsza) |
 | `SQUELCH_MARGIN` | `10` | próg otwarcia ponad poziomem szumu (S-metr, dB) |
 | `RMS_MARGIN` | `20` | próg otwarcia ponad szumem (energia audio, dB) |
@@ -39,6 +102,8 @@ Strona odsłuchu: `http://<adres-pi>:8074/`
 | `MIN_DURATION_SECONDS` | `1` | odrzucanie krótszych nagrań |
 | `MP3_BITRATE` | `32` | bitrate MP3 (kbps) |
 | `OUTPUT_RATE` | `12000` | częstotliwość próbkowania audio |
+| `RECORDINGS_DIR` | `./recordings` | katalog nagrań **na hoście** (w kontenerze zawsze `/recordings`) |
+| `WEB_PORT` | `8074` | port strony odsłuchu **na hoście** (w kontenerze zawsze `8074`) |
 | `TZ` | `Europe/Warsaw` | strefa czasowa nazw plików |
 
 ### Transkryber
@@ -49,8 +114,18 @@ Strona odsłuchu: `http://<adres-pi>:8074/`
 | `LANGUAGE` | `pl` | język transkrypcji |
 | `MODEL_PATH` | `/models/ggml-base-q5_1.bin` | model whisper.cpp (base Q5) |
 | `THREADS` | `4` | liczba wątków whisper |
-| `PRE_ROLL_SECONDS` | `2` | korekta znaczników czasu o bufor pre-roll |
+| `PRE_ROLL_SECONDS` | `2` | korekta znaczników czasu o bufer pre-roll |
 | `MAX_FILE_MB` | `20` | pomijaj pliki większe niż (MB) |
+
+W `.env.example` ustawione jest `THREADS=3`. J1800 ma 4 wątki logiczne, ale system je też wykorzystuje — przy `4` transkrypcja potrafi wypchnąć resztę.
+
+## Uwagi do obrazów
+
+- **`transcriber` kompiluje whisper.cpp ze źródeł.** Wersja jest przypięta w `transcriber/Dockerfile` (`ARG WHISPER_VERSION=v1.9.4`) — bez tego każdy build dostałby inną rewizję i obrazy nie byłyby powtarzalne.
+- **`GGML_NATIVE=OFF` jest celowe.** ggml domyślnie kompiluje z `-march=native`, czyli pod procesor maszyny budującej. Runner GitHub Actions i J1800 to różne CPU, więc binarka zależałaby od tego, na czym akurat ścigał runner — zmiana runnerów po cichu zmieniałaby obraz, a instrukcje spoza AVX2 dałyby na J1800 `SIGILL`. Na ARM ustaw `ON`.
+- **`WHISPER_BUILD_IS_DEV=OFF` jest celowe.** Whisper domyślnie zgłasza się jako „1.9.4-dev" nawet przy budowie z taga release. Ta flaga sprawia, że wersja w logach odpowiada rzeczywistości.
+- **Model whisper (base Q5, ~60 MB) jest wbudowany w obraz.** Dzięki temu wdrożenie jest powtarzalne; wersję modelu zmienisz w `ARG MODEL_FILE`.
+- **`.dockerignore` leży w katalogach `recorder/`, `web/`, `transcriber/`, nie w rogu repo.** Docker szuka go w katalogu kontekstu buildu, a konteksty to `./recorder` itd.
 
 ## Współistnienie z nasłuchem
 

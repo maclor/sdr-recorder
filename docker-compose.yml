@@ -1,57 +1,65 @@
+# Wdrożenie na serwerze: obrazy z GitHub Container Registry, bez lokalnego buildu.
+#
+#   serwer:  docker compose -f docker-compose.yml ...
+#   lokalnie: docker compose up -d --build
+#
+# Lokalny build dodaje docker-compose.override.yml, który compose scala automatycznie.
+# Na serwerze skrypt deploy.sh zawsze wskazuje -f docker-compose.yml, więc override
+# nigdy nie jest mieszany i Docker nie próbuje zbudować obrazów na serwerze.
+#
+# Wszystkie parametry czytane są z .env (wzorzec: .env.example).
+
 services:
   recorder:
-    build:
-      context: ./recorder
-    image: sdr-recorder:latest
+    image: ghcr.io/maclor/sdr-recorder/recorder:${IMAGE_TAG:-latest}
     container_name: sdr-recorder
     restart: unless-stopped
     environment:
-      OPENWEBRX_WS_URL: ws://192.168.68.67:8073/ws/
-      FREQUENCIES: 149287500:nfm
-      SQUELCH_MARGIN: "10"
-      RMS_MARGIN: "20"
-      PRE_ROLL_SECONDS: "2"
-      END_SILENCE_SECONDS: "3"
-      MIN_DURATION_SECONDS: "1"
-      MAX_RECORDING_SECONDS: "600"
-      NOISE_WINDOW_SECONDS: "600"
-      MP3_BITRATE: "32"
-      OUTPUT_RATE: "12000"
-      TZ: Europe/Warsaw
+      OPENWEBRX_WS_URL: ${OPENWEBRX_WS_URL:-ws://192.168.68.67:8073/ws/}
+      FREQUENCIES: ${FREQUENCIES:-149287500:nfm}
+      SQUELCH_MARGIN: "${SQUELCH_MARGIN:-10}"
+      RMS_MARGIN: "${RMS_MARGIN:-20}"
+      PRE_ROLL_SECONDS: "${PRE_ROLL_SECONDS:-2}"
+      END_SILENCE_SECONDS: "${END_SILENCE_SECONDS:-3}"
+      MIN_DURATION_SECONDS: "${MIN_DURATION_SECONDS:-1}"
+      MAX_RECORDING_SECONDS: "${MAX_RECORDING_SECONDS:-600}"
+      NOISE_WINDOW_SECONDS: "${NOISE_WINDOW_SECONDS:-600}"
+      MP3_BITRATE: "${MP3_BITRATE:-32}"
+      OUTPUT_RATE: "${OUTPUT_RATE:-12000}"
+      TZ: ${TZ:-Europe/Warsaw}
       RECORDINGS_DIR: /recordings
     volumes:
-      - ./recordings:/recordings
+      - ${RECORDINGS_DIR:-./recordings}:/recordings
     extra_hosts:
+      # Przydatne, gdy OpenWebRX działa na tym samym hoście:
+      # OPENWEBRX_WS_URL=ws://host.docker.internal:8073/ws/
       - "host.docker.internal:host-gateway"
 
   web:
-    build:
-      context: ./web
-    image: sdr-recorder-web:latest
+    image: ghcr.io/maclor/sdr-recorder/web:${IMAGE_TAG:-latest}
     container_name: sdr-recorder-web
     restart: unless-stopped
     environment:
       RECORDINGS_DIR: /recordings
       WEB_PORT: "8074"
-      TZ: Europe/Warsaw
+      TZ: ${TZ:-Europe/Warsaw}
     volumes:
-      - ./recordings:/recordings
+      - ${RECORDINGS_DIR:-./recordings}:/recordings
     ports:
-      - "8074:8074"
+      # ${WEB_PORT} to port na hoście, w kontenerze zawsze 8074.
+      - "${WEB_PORT:-8074}:8074"
 
   transcriber:
-    build:
-      context: ./transcriber
-    image: sdr-transcriber:latest
+    image: ghcr.io/maclor/sdr-recorder/transcriber:${IMAGE_TAG:-latest}
     container_name: sdr-transcriber
     restart: unless-stopped
     environment:
       RECORDINGS_DIR: /recordings
-      MIN_AGE_SECONDS: "300"
-      LANGUAGE: pl
-      PRE_ROLL_SECONDS: "2"
-      MAX_FILE_MB: "20"
-      THREADS: "4"
-      TZ: Europe/Warsaw
+      MIN_AGE_SECONDS: "${MIN_AGE_SECONDS:-300}"
+      LANGUAGE: ${LANGUAGE:-pl}
+      PRE_ROLL_SECONDS: "${PRE_ROLL_SECONDS:-2}"
+      MAX_FILE_MB: "${MAX_FILE_MB:-20}"
+      THREADS: "${THREADS:-4}"
+      TZ: ${TZ:-Europe/Warsaw}
     volumes:
-      - ./recordings:/recordings
+      - ${RECORDINGS_DIR:-./recordings}:/recordings

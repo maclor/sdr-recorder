@@ -1,7 +1,7 @@
-FROM python:3.11-slim
+FROM python:3.11-slim-bookworm
 
 WORKDIR /app
 
-COPY web.py .
+COPY web.py ./
 
 CMD ["python", "-u", "web.py"]

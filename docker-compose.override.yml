@@ -1,0 +1,15 @@
+# Scalane automatycznie przez `docker compose` (bez -f) — wyłącznie lokalny build.
+# Na serwerze ten plik nie jest używany: deploy.sh woła docker compose z -f docker-compose.yml.
+
+services:
+  recorder:
+    build:
+      context: ./recorder
+
+  web:
+    build:
+      context: ./web
+
+  transcriber:
+    build:
+      context: ./transcriber
