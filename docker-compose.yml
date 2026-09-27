@@ -1,13 +1,11 @@
-# Wdrożenie na serwerze: obrazy z GitHub Container Registry, bez lokalnego buildu.
+# Server deployment: images from GitHub Container Registry, no local build.
 #
-#   serwer:  docker compose -f docker-compose.yml ...
-#   lokalnie: docker compose up -d --build
+#   server:  docker compose -f docker-compose.yml ...
+#   local:   docker compose up -d --build
 #
-# Lokalny build dodaje docker-compose.override.yml, który compose scala automatycznie.
-# Na serwerze skrypt deploy.sh zawsze wskazuje -f docker-compose.yml, więc override
-# nigdy nie jest mieszany i Docker nie próbuje zbudować obrazów na serwerze.
-#
-# Wszystkie parametry czytane są z .env (wzorzec: .env.example).
+# The local build lives in docker-compose.override.yml, which compose merges
+# automatically. On the server deploy.sh always passes -f docker-compose.yml,
+# so the override is never merged and Docker never tries to build there.
 
 services:
   recorder:
@@ -31,7 +29,7 @@ services:
     volumes:
       - ${RECORDINGS_DIR:-./recordings}:/recordings
     extra_hosts:
-      # Przydatne, gdy OpenWebRX działa na tym samym hoście:
+      # Useful when OpenWebRX runs on this same host:
       # OPENWEBRX_WS_URL=ws://host.docker.internal:8073/ws/
       - "host.docker.internal:host-gateway"
 
@@ -46,7 +44,7 @@ services:
     volumes:
       - ${RECORDINGS_DIR:-./recordings}:/recordings
     ports:
-      # ${WEB_PORT} to port na hoście, w kontenerze zawsze 8074.
+      # ${WEB_PORT} is the host port; inside the container it is always 8074.
       - "${WEB_PORT:-8074}:8074"
 
   transcriber:

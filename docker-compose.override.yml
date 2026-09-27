@@ -1,5 +1,6 @@
-# Scalane automatycznie przez `docker compose` (bez -f) — wyłącznie lokalny build.
-# Na serwerze ten plik nie jest używany: deploy.sh woła docker compose z -f docker-compose.yml.
+# Merged automatically by `docker compose` (without -f) -- local build only.
+# Unused on the server: deploy.sh invokes docker compose with
+# -f docker-compose.yml, which keeps this file out of the picture.
 
 services:
   recorder:

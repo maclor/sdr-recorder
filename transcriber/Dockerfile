@@ -1,14 +1,14 @@
 FROM python:3.11-slim-bookworm AS builder
 
-# Wersja whisper.cpp jest przypięta, żeby build dawał powtarzalny wynik.
+# whisper.cpp is pinned so that builds are reproducible.
 ARG WHISPER_VERSION=v1.9.4
 
-# GGML_NATIVE=OFF kompiluje pod bazowy x86-64 zamiast pod maszynę budującą.
-# ggml domyślnie wstawia -march=native, przez co binarka zależy od tego, na
-# jakim CPU akurat ścigał runner GitHub Actions. Runner i serwer mają różne
-# procesory, więc jedna zmiana runnerów po cichu zmienia obraz, a instrukcje
-# spoza AVX2 potrafią dać SIGILL na J1800.
-# Na ARM ustaw na ON.
+# GGML_NATIVE=OFF compiles for baseline x86-64 instead of the build machine.
+# ggml passes -march=native by default, which makes the binary depend on
+# whatever CPU the GitHub Actions runner happened to be. The runner and the
+# server have different CPUs, so swapping runners silently changes the image,
+# and instructions outside AVX2 can raise SIGILL on the J1800.
+# Set this to ON for ARM.
 ARG GGML_NATIVE=OFF
 
 RUN apt-get update \

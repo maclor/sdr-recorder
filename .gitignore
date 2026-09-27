@@ -1,10 +1,10 @@
-# Nagrania i ich transkrypcje — nigdy nie commitujemy.
+# Recordings and their transcripts -- never commit these.
 recordings/
 
-# Konfiguracja lokalna/wdrożeniowa (wzorzec jest w .env.example).
+# Local/deployment configuration (the template lives in .env.example).
 .env
 
-# Historia wdrożeń prowadzona przez deploy.sh.
+# Deployment history kept by deploy.sh.
 .deploy-history
 
 # Python
