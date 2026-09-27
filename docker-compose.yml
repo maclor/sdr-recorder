@@ -1,0 +1,57 @@
+services:
+  recorder:
+    build:
+      context: ./recorder
+    image: sdr-recorder:latest
+    container_name: sdr-recorder
+    restart: unless-stopped
+    environment:
+      OPENWEBRX_WS_URL: ws://192.168.68.67:8073/ws/
+      FREQUENCIES: 149287500:nfm
+      SQUELCH_MARGIN: "10"
+      RMS_MARGIN: "20"
+      PRE_ROLL_SECONDS: "2"
+      END_SILENCE_SECONDS: "3"
+      MIN_DURATION_SECONDS: "1"
+      MAX_RECORDING_SECONDS: "600"
+      NOISE_WINDOW_SECONDS: "600"
+      MP3_BITRATE: "32"
+      OUTPUT_RATE: "12000"
+      TZ: Europe/Warsaw
+      RECORDINGS_DIR: /recordings
+    volumes:
+      - ./recordings:/recordings
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  web:
+    build:
+      context: ./web
+    image: sdr-recorder-web:latest
+    container_name: sdr-recorder-web
+    restart: unless-stopped
+    environment:
+      RECORDINGS_DIR: /recordings
+      WEB_PORT: "8074"
+      TZ: Europe/Warsaw
+    volumes:
+      - ./recordings:/recordings
+    ports:
+      - "8074:8074"
+
+  transcriber:
+    build:
+      context: ./transcriber
+    image: sdr-transcriber:latest
+    container_name: sdr-transcriber
+    restart: unless-stopped
+    environment:
+      RECORDINGS_DIR: /recordings
+      MIN_AGE_SECONDS: "300"
+      LANGUAGE: pl
+      PRE_ROLL_SECONDS: "2"
+      MAX_FILE_MB: "20"
+      THREADS: "4"
+      TZ: Europe/Warsaw
+    volumes:
+      - ./recordings:/recordings
