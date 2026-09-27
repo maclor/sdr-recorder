@@ -11,7 +11,7 @@ Trzy kontenery Dockera:
 ## Jak działa
 
 1. `recorder` loguje się do OpenWebRX jako headless klient `receiver`, wybiera profil SDR pokrywający docelową częstotliwość i ustawia demodulację (domyślnie NFM).
-2. Squelch serwera jest wyłączony (ustawiony na otwarty) — bramkowanie robi sam rejestrator na podstawie **S-metra** i **energii audio**. Poziom szumu jest liczony jako **przesuwne minimum z ostatnich `NOISE_WINDOW_SECONDS`** (śledzi zmiany szumu w ciągu dnia), a próg otwarcia to `SQUELCH_MARGIN`/`RMS_MARGIN` dB ponad tym minimum. Dzięki temu działa **bufor pre-roll** (początek transmisji nie jest ucięty), sam szum nie jest nagrywany, a ciągła nośna/interferencja po chwili przestaje być rejestrowana.
+2. Squelch serwera jest wyłączony (ustawiony na otwarty) — bramkowanie robi sam rejestrator na podstawie **S-metra** i **energii audio**. Poziom szumu jest liczony jako **przesuwne minimum z ostatnich `NOISE_WINDOW_SECONDS`** (śledzi zmiany szumu w ciągu dnia), a próg otwarcia to `SQUELCH_MARGIN`/`RMS_MARGIN` dB ponad tym minimum. Dzięki temu działa **bufer pre-roll** (początek transmisji nie jest ucięty), sam szum nie jest nagrywany, a ciągła nośna/interferencja po chwili przestaje być rejestrowana.
 3. Gdy pojawia się sygnał, rejestrator najpierw zapisuje bufor pre-roll (dźwięk sprzed wykrycia), potem strumień; kończy nagranie po `END_SILENCE_SECONDS` ciszy (twardy limit `MAX_RECORDING_SECONDS`).
 4. Pliki trafiają do `recordings/YYYY-MM-DD/YYYY-MM-DD_HH-MM-SS.mp3` (czas lokalny).
 5. `transcriber` co ~1 min przeszukuje nagrania starsze niż `MIN_AGE_SECONDS`, transkrybuje je (whisper.cpp, base Q5) i zapisuje obok pliku `.txt` w formacie `[GG:MM:SS] tekst` (oraz `.json` ze statusem).
@@ -48,12 +48,14 @@ Obrazy buduje **GitHub Actions** i pcha do **GitHub Container Registry**. Wdroż
 git push  →  Actions (build + push do ghcr.io)  →  ./deploy.sh <tag>  na serwerze
 ```
 
-Każdy push na `main` przebudowuje i wypchnie trzy obrazy. Pull request tylko buduje (bez wypychania). Cache warstw trzyma się na GitHubie, więc po pierwszym budowaniu — a głównie po tym kosztownym — kolejne trwają sekundy.
+Buildy uruchamiają się **wyłącznie** przy wypchnięciu na `main` albo ręcznie przez „Run workflow" — wtedy w UI wybierasz gałąź. Pull requesty nic nie budują.
+
+Cache warstw trzyma się na GitHubie, więc po pierwszym budowaniu — a głównie po tym kosztownym, z kompilacją whisper.cpp — kolejne trwają sekundy.
 
 Obrazy dostają dwa tagi:
 
-- `sha-xxxxxxx` — konkretny commit, do wdrażania reprodukowalnego i do rollbacku,
-- `latest` — to, co jest aktualnie na `main`.
+- `sha-xxxxxxx` — konkretny commit, do wdrażania reprodukowalnego i do rollbacku. Dostają go **wszystkie** buildy, także z gałęzi,
+- `latest` — **tylko** buildy z `main`. Gałąź testowa nigdy go nie nadpisze, więc `./deploy.sh` bez argumentu zawsze znaczy „to, co jest na `main`".
 
 Repozytorium jest publiczne, więc obrazy w GHCR też. Serwer ciągnie je anonimowo, **`docker login` nie jest potrzebny** i nie ma żadnych sekretów do skonfigurowania.
 
