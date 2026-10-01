@@ -11,16 +11,38 @@ from pathlib import Path
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("sdr-transcriber")
 
+
+def env_number(name, default, cast):
+    """Read a numeric setting, falling back to the default on a bad value.
+
+    A typo in the compose file must not stop the container from starting.
+    """
+    raw = os.environ.get(name, str(default))
+    try:
+        return cast(raw)
+    except (TypeError, ValueError):
+        logger.warning("%s=%r is not a valid number, using %r", name, raw, default)
+        return cast(str(default))
+
+
 RECORDINGS_DIR = Path(os.environ.get("RECORDINGS_DIR", "/recordings"))
-MIN_AGE_SECONDS = int(os.environ.get("MIN_AGE_SECONDS", "300"))
+MIN_AGE_SECONDS = env_number("MIN_AGE_SECONDS", 300, int)
 LANGUAGE = os.environ.get("LANGUAGE", "pl")
-PRE_ROLL_SECONDS = float(os.environ.get("PRE_ROLL_SECONDS", "2"))
-SLEEP_SECONDS = int(os.environ.get("SLEEP_SECONDS", "60"))
-PAUSE_SECONDS = float(os.environ.get("PAUSE_SECONDS", "5"))
-MAX_FILE_MB = int(os.environ.get("MAX_FILE_MB", "20"))
+PRE_ROLL_SECONDS = env_number("PRE_ROLL_SECONDS", 2.0, float)
+SLEEP_SECONDS = env_number("SLEEP_SECONDS", 60, int)
+PAUSE_SECONDS = env_number("PAUSE_SECONDS", 5.0, float)
+MAX_FILE_MB = env_number("MAX_FILE_MB", 20, int)
 WHISPER_BIN = os.environ.get("WHISPER_BIN", "whisper-cli")
 MODEL_PATH = os.environ.get("MODEL_PATH", "/models/ggml-base-q5_1.bin")
-THREADS = os.environ.get("THREADS", "4")
+# 3, not 4: the J1800 has 4 logical cores but the OS and the recorder need
+# them too. Transcribing with all of them starves everything else.
+THREADS = env_number("THREADS", 3, int)
+WHISPER_BEAM_SIZE = env_number("WHISPER_BEAM_SIZE", 2, int)
+WHISPER_BEST_OF = env_number("WHISPER_BEST_OF", 2, int)
+WHISPER_NO_SPEECH_THRESHOLD = env_number("WHISPER_NO_SPEECH_THRESHOLD", 0.6, float)
+WHISPER_SUPPRESS_NON_SPEECH = os.environ.get("WHISPER_SUPPRESS_NON_SPEECH", "1").strip().lower() not in {
+    "0", "false", "no", "off"
+}
 
 FINAL_STATUSES = {"transcribed", "no_speech", "skipped", "error"}
 
@@ -87,8 +109,20 @@ def transcribe_file(mp3):
             write_status(mp3, "error", "audio decode failed")
             return False
 
+        whisper_cmd = [
+            WHISPER_BIN,
+            "-m", MODEL_PATH,
+            "-l", LANGUAGE,
+            "-t", str(THREADS),
+            "-bs", str(WHISPER_BEAM_SIZE),
+            "-bo", str(WHISPER_BEST_OF),
+            "-nth", str(WHISPER_NO_SPEECH_THRESHOLD),
+        ]
+        if WHISPER_SUPPRESS_NON_SPEECH:
+            whisper_cmd.append("-sns")
+        whisper_cmd.extend(["-f", wav])
         proc = subprocess.run(
-            [WHISPER_BIN, "-m", MODEL_PATH, "-l", LANGUAGE, "-t", THREADS, "-f", wav],
+            whisper_cmd,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
         )
 
@@ -160,6 +194,11 @@ def process_batch():
 
 def main():
     logger.info("using whisper binary %s with model %s", WHISPER_BIN, MODEL_PATH)
+    logger.info(
+        "whisper settings: threads=%d beam=%d best_of=%d no_speech=%.2f suppress_nst=%s",
+        THREADS, WHISPER_BEAM_SIZE, WHISPER_BEST_OF,
+        WHISPER_NO_SPEECH_THRESHOLD, WHISPER_SUPPRESS_NON_SPEECH,
+    )
     while True:
         try:
             process_batch()
