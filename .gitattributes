@@ -1,0 +1,6 @@
+# Normalize line endings on commit.
+* text=auto
+
+# deploy.sh must be LF regardless of the git configuration. CRLF breaks the
+# shebang on the server: "bad interpreter: /usr/bin/env bash^M".
+deploy.sh text eol=lf

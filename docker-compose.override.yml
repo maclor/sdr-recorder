@@ -1,0 +1,16 @@
+# Merged automatically by `docker compose` (without -f) -- local build only.
+# Unused on the server: deploy.sh invokes docker compose with
+# -f docker-compose.yml, which keeps this file out of the picture.
+
+services:
+  recorder:
+    build:
+      context: ./recorder
+
+  web:
+    build:
+      context: ./web
+
+  transcriber:
+    build:
+      context: ./transcriber

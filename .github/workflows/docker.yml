@@ -1,0 +1,84 @@
+name: docker
+
+# Builds run only from main (push) or manually from any branch
+# (workflow_dispatch). Pull requests do not build -- verification is manual,
+# on demand.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository }}
+
+permissions:
+  contents: read
+  packages: write
+
+# A manual build from a branch only cancels an earlier build of that same
+# branch, so a test branch can never interrupt main.
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.service }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [recorder, web, transcriber]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}
+          # A manual build from a branch only gets the sha-xxxxxxx tag;
+          # `latest` is reserved for main so test branches cannot overwrite it.
+          tags: |
+            type=sha,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.service }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Compiling whisper.cpp is the only expensive step, so this cache is
+          # the single most important setting here.
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  deploy-hint:
+    name: deploy command
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Hint
+        run: |
+          short="$(printf '%s' '${{ github.sha }}' | cut -c1-7)"
+          echo "### On the server, in the directory containing docker-compose.yml:"
+          echo '```bash'
+          echo "./deploy.sh sha-${short}"
+          echo '```'

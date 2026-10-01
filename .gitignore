@@ -1,0 +1,12 @@
+# Recordings and their transcripts -- never commit these.
+recordings/
+
+# Local/deployment configuration (the template lives in .env.example).
+.env
+
+# Deployment history kept by deploy.sh.
+.deploy-history
+
+# Python
+__pycache__/
+*.pyc
