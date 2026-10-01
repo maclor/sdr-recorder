@@ -3,9 +3,10 @@ import json
 import logging
 import math
 import os
+import re
 import signal
-import struct
 import subprocess
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -26,6 +27,26 @@ NOISE_WINDOW_SECONDS = float(os.environ.get("NOISE_WINDOW_SECONDS", "600"))
 MP3_BITRATE = int(os.environ.get("MP3_BITRATE", "32"))
 RECORDINGS_DIR = Path(os.environ.get("RECORDINGS_DIR", "/recordings"))
 OPENWEBRX_WS_URL = os.environ.get("OPENWEBRX_WS_URL", "ws://192.168.68.67:8073/ws/")
+
+
+def env_bool(name, default=True):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+# Recordings are first kept under a non-MP3 suffix.  This means that the web
+# service and the transcriber cannot see a file while it is being denoised.
+DENOISE_ENABLED = env_bool("DENOISE_ENABLED")
+DENOISE_BACKEND = os.environ.get("DENOISE_BACKEND", "deepfilternet").strip().lower()
+DENOISE_NR = float(os.environ.get("DENOISE_NR", "12"))
+DENOISE_NOISE_FLOOR_DB = float(os.environ.get("DENOISE_NOISE_FLOOR_DB", "-45"))
+DENOISE_SILENCE_DB = float(os.environ.get("DENOISE_SILENCE_DB", "-42"))
+DENOISE_MIN_SIGNAL_SECONDS = float(os.environ.get("DENOISE_MIN_SIGNAL_SECONDS", "0.5"))
+DEEPFILTER_BIN = os.environ.get("DEEPFILTER_BIN", "deep-filter")
+DEEPFILTER_POST_FILTER = env_bool("DEEPFILTER_POST_FILTER")
+DEEPFILTER_COMPENSATE_DELAY = env_bool("DEEPFILTER_COMPENSATE_DELAY")
 
 INDEX_TABLE = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8]
 STEP_TABLE = [
@@ -148,7 +169,9 @@ class Recorder:
         self.recording = False
         self.lame = None
         self.rec_file = None
+        self.rec_final_file = None
         self.rec_start = None
+        self.postprocess_tasks = set()
 
     async def run(self):
         while self._running:
@@ -395,10 +418,12 @@ class Recorder:
             logger.error("cannot create recordings dir: %s", e)
             return
         stem = now.strftime("%Y-%m-%d_%H-%M-%S")
-        path = day_dir / (stem + ".mp3")
+        final_path = day_dir / (stem + ".mp3")
+        path = final_path.with_name(final_path.name + ".part")
         i = 1
-        while path.exists():
-            path = day_dir / ("%s_%d.mp3" % (stem, i))
+        while final_path.exists() or path.exists():
+            final_path = day_dir / ("%s_%d.mp3" % (stem, i))
+            path = final_path.with_name(final_path.name + ".part")
             i += 1
         cmd = [
             "ffmpeg", "-loglevel", "error", "-y",
@@ -415,6 +440,7 @@ class Recorder:
             return
         self.lame = proc
         self.rec_file = path
+        self.rec_final_file = final_path
         self.rec_start = time.monotonic()
         self.recording = True
         try:
@@ -422,15 +448,17 @@ class Recorder:
         except (BrokenPipeError, OSError):
             self._finalize_recording()
             return
-        logger.info("recording started: %s", path.name)
+        logger.info("recording started: %s", final_path.name)
 
     def _finalize_recording(self):
         proc = self.lame
         path = self.rec_file
+        final_path = self.rec_final_file
         start = self.rec_start
         self.recording = False
         self.lame = None
         self.rec_file = None
+        self.rec_final_file = None
         self.rec_start = None
 
         if proc is not None:
@@ -447,16 +475,206 @@ class Recorder:
                 except Exception:
                     pass
 
-        if path is not None and start is not None:
+        if path is not None and final_path is not None and start is not None:
             dur = time.monotonic() - start
             if dur < MIN_DURATION_SECONDS:
                 try:
                     path.unlink()
-                    logger.info("discarded short recording (%.1fs): %s", dur, path.name)
+                    logger.info("discarded short recording (%.1fs): %s", dur, final_path.name)
                 except OSError:
                     pass
             else:
-                logger.info("saved recording (%.1fs): %s", dur, path)
+                self._queue_postprocessing(path, final_path, dur)
+
+    def _queue_postprocessing(self, path, final_path, duration):
+        """Denoise in the background and publish only a useful recording."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # This path is useful for a direct/synchronous caller as well as
+            # making shutdown robust if finalization happens outside run().
+            self._postprocess_recording(path, final_path, duration)
+            return
+
+        task = loop.create_task(asyncio.to_thread(
+            self._postprocess_recording, path, final_path, duration
+        ))
+        self.postprocess_tasks.add(task)
+        task.add_done_callback(self.postprocess_tasks.discard)
+
+    def _postprocess_recording(self, path, final_path, duration):
+        """Run noise reduction, reject silence, then atomically publish MP3."""
+        processed_path = final_path.with_name(final_path.name + ".processing")
+        enhanced_audio = None
+        try:
+            enhanced_audio = self._enhance_audio(path, processed_path)
+
+            if not self._has_signal_after_denoise(enhanced_audio):
+                if enhanced_audio != processed_path:
+                    enhanced_audio.unlink(missing_ok=True)
+                processed_path.unlink(missing_ok=True)
+                path.unlink(missing_ok=True)
+                logger.info("discarded recording containing only noise (%.1fs): %s", duration, final_path.name)
+                return
+
+            if enhanced_audio != processed_path:
+                self._encode_mp3(enhanced_audio, processed_path)
+
+            # os.replace is atomic within the recordings directory.  A file
+            # therefore becomes visible to both web and transcriber only after
+            # denoising and signal detection have completed successfully.
+            os.replace(processed_path, final_path)
+            path.unlink(missing_ok=True)
+            logger.info("published denoised recording (%.1fs): %s", duration, final_path)
+        except Exception:
+            # Keep the pending source for diagnostics/retry.  Its .part suffix
+            # deliberately keeps it out of the public recording and scanning
+            # glob patterns.
+            processed_path.unlink(missing_ok=True)
+            logger.exception("could not denoise recording; kept pending file: %s", path)
+        finally:
+            if enhanced_audio is not None and enhanced_audio != processed_path:
+                enhanced_audio.unlink(missing_ok=True)
+
+    def _enhance_audio(self, path, processed_path):
+        """Return a denoised WAV/MP3 path which is still private to recorder."""
+        if not DENOISE_ENABLED:
+            # Still run the signal test when denoising is explicitly disabled;
+            # this keeps the publication rule predictable.
+            os.replace(path, processed_path)
+            return processed_path
+
+        if DENOISE_BACKEND == "deepfilternet":
+            return self._enhance_with_deepfilternet(path)
+        if DENOISE_BACKEND == "afftdn":
+            self._run_command(
+                [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", str(path),
+                    "-af", "afftdn=nr=%g:nf=%g:tn=1" % (
+                        DENOISE_NR, DENOISE_NOISE_FLOOR_DB
+                    ),
+                    "-ar", "32000", "-ac", "1",
+                    "-c:a", "libmp3lame", "-b:a", str(MP3_BITRATE) + "k",
+                    "-f", "mp3", str(processed_path),
+                ],
+                "ffmpeg afftdn failed",
+            )
+            return processed_path
+        raise RuntimeError("unknown DENOISE_BACKEND: %s" % DENOISE_BACKEND)
+
+    def _enhance_with_deepfilternet(self, path):
+        """Enhance one recording with the official CPU-only DeepFilterNet CLI.
+
+        The standalone CLI works on 48 kHz WAV files and writes a WAV with the
+        same basename.  A temporary directory keeps both files invisible to
+        the web service and the transcriber.
+        """
+        work_dir = Path(tempfile.mkdtemp(prefix=".deepfilter-", dir=str(path.parent)))
+        input_wav = work_dir / "input.wav"
+        output_dir = work_dir / "out"
+        output_dir.mkdir()
+        try:
+            self._run_command(
+                [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", str(path),
+                    "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le",
+                    str(input_wav),
+                ],
+                "could not convert recording to 48 kHz WAV",
+            )
+            cmd = [DEEPFILTER_BIN]
+            if DEEPFILTER_POST_FILTER:
+                cmd.append("--pf")
+            if DEEPFILTER_COMPENSATE_DELAY:
+                cmd.append("-D")
+            cmd.extend(["-o", str(output_dir), str(input_wav)])
+            self._run_command(cmd, "DeepFilterNet failed")
+            enhanced_wav = output_dir / input_wav.name
+            if not enhanced_wav.is_file():
+                raise RuntimeError("DeepFilterNet produced no output WAV")
+            # The directory must survive until signal detection and final MP3
+            # encoding complete.  The caller removes it after this method's
+            # returned path has been consumed by _postprocess_recording.
+            kept_wav = path.with_name(path.name + ".enhanced.wav")
+            os.replace(enhanced_wav, kept_wav)
+            return kept_wav
+        finally:
+            try:
+                for item in sorted(work_dir.rglob("*"), reverse=True):
+                    if item.is_file() or item.is_symlink():
+                        item.unlink(missing_ok=True)
+                    elif item.is_dir():
+                        item.rmdir()
+                work_dir.rmdir()
+            except OSError:
+                logger.warning("could not clean DeepFilterNet temporary directory: %s", work_dir)
+
+    @staticmethod
+    def _run_command(cmd, message):
+        """Run an audio command and expose a short useful error on failure."""
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or "").strip().splitlines()
+            raise RuntimeError("%s: %s" % (message, detail[-1] if detail else "unknown error"))
+
+    @staticmethod
+    def _encode_mp3(source, destination):
+        Recorder._run_command(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(source),
+                "-ar", "32000", "-ac", "1",
+                "-c:a", "libmp3lame", "-b:a", str(MP3_BITRATE) + "k",
+                "-f", "mp3", str(destination),
+            ],
+            "could not encode denoised recording",
+        )
+
+    @staticmethod
+    def _has_signal_after_denoise(path):
+        """Return whether a non-silent segment remains in a processed file."""
+        detect = subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "info",
+                "-i", str(path),
+                "-af", "silencedetect=noise=%gdB:d=%g" % (
+                    DENOISE_SILENCE_DB, DENOISE_MIN_SIGNAL_SECONDS
+                ),
+                "-f", "null", "-",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if detect.returncode != 0:
+            detail = (detect.stderr or "").strip().splitlines()
+            raise RuntimeError(detail[-1] if detail else "silence detection failed")
+
+        output = detect.stderr or ""
+        starts = re.findall(r"silence_start:\s*([-+]?\d+(?:\.\d+)?)", output)
+        ends = re.findall(r"silence_end:\s*([-+]?\d+(?:\.\d+)?)", output)
+        if not starts:
+            return True
+
+        # A file which starts with silence and never reports its end is silent
+        # from beginning to end.  Any silence_end means that audio rose above
+        # the post-denoise threshold for long enough to count as a signal.
+        try:
+            starts_at_beginning = float(starts[0]) <= 0.05
+        except ValueError:
+            starts_at_beginning = False
+        return not starts_at_beginning or bool(ends)
+
+    async def wait_for_postprocessing(self):
+        if self.postprocess_tasks:
+            await asyncio.gather(*list(self.postprocess_tasks), return_exceptions=True)
 
     def stop(self):
         self._running = False
@@ -490,6 +708,7 @@ async def main():
         await task
     except asyncio.CancelledError:
         pass
+    await recorder.wait_for_postprocessing()
 
 
 if __name__ == "__main__":
