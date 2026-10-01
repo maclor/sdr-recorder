@@ -123,8 +123,12 @@ Wszystko poniżej ustawia się w `.env`, a `docker-compose.yml` czyta to przez `
 | `MIN_AGE_SECONDS` | `300` | transkrybuj nagrania starsze niż (s) |
 | `LANGUAGE` | `pl` | język transkrypcji |
 | `MODEL_PATH` | `/models/ggml-base-q5_1.bin` | model whisper.cpp (base Q5) |
-| `THREADS` | `4` | liczba wątków whisper |
-| `PRE_ROLL_SECONDS` | `2` | korekta znaczników czasu o bufer pre-roll |
+| `THREADS` | `3` | liczba wątków whisper; bezpieczny kompromis dla J1800 |
+| `WHISPER_BEAM_SIZE` | `2` | szerokość beam search; mniejsza wartość zmniejsza obciążenie |
+| `WHISPER_BEST_OF` | `2` | liczba kandydatów dekodowania |
+| `WHISPER_NO_SPEECH_THRESHOLD` | `0.6` | próg odrzucania fragmentów bez mowy |
+| `WHISPER_SUPPRESS_NON_SPEECH` | `1` | tłumienie tokenów niespeechowych i halucynacji na szumie |
+| `PRE_ROLL_SECONDS` | `2` | korekta znaczników czasu o bufor pre-roll |
 | `MAX_FILE_MB` | `20` | pomijaj pliki większe niż (MB) |
 
 W `.env.example` ustawione jest `THREADS=3`. J1800 ma 4 wątki logiczne, ale system je też wykorzystuje — przy `4` transkrypcja potrafi wypchnąć resztę.

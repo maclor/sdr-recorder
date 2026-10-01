@@ -65,7 +65,11 @@ services:
       LANGUAGE: ${LANGUAGE:-pl}
       PRE_ROLL_SECONDS: "${PRE_ROLL_SECONDS:-2}"
       MAX_FILE_MB: "${MAX_FILE_MB:-20}"
-      THREADS: "${THREADS:-4}"
+      THREADS: "${THREADS:-3}"
+      WHISPER_BEAM_SIZE: "${WHISPER_BEAM_SIZE:-2}"
+      WHISPER_BEST_OF: "${WHISPER_BEST_OF:-2}"
+      WHISPER_NO_SPEECH_THRESHOLD: "${WHISPER_NO_SPEECH_THRESHOLD:-0.6}"
+      WHISPER_SUPPRESS_NON_SPEECH: "${WHISPER_SUPPRESS_NON_SPEECH:-1}"
       TZ: ${TZ:-Europe/Warsaw}
     volumes:
       - ${RECORDINGS_DIR:-./recordings}:/recordings
