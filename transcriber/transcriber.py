@@ -44,6 +44,11 @@ WHISPER_SUPPRESS_NON_SPEECH = os.environ.get("WHISPER_SUPPRESS_NON_SPEECH", "1")
     "0", "false", "no", "off"
 }
 
+# Status files written before the audio pipeline was fixed may contain
+# "no_speech" even though the recording is usable.  Versioning lets us retry
+# those files once after deployment without retrying genuinely empty files on
+# every polling cycle forever.
+STATUS_VERSION = 2
 FINAL_STATUSES = {"transcribed", "no_speech", "skipped", "error"}
 
 TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})")
@@ -66,7 +71,7 @@ def parse_recording_time(filename):
 
 
 def write_status(mp3, status, message=None):
-    payload = {"status": status}
+    payload = {"status": status, "status_version": STATUS_VERSION}
     if message:
         payload["message"] = message
     meta = mp3.with_suffix(".json")
@@ -76,14 +81,19 @@ def write_status(mp3, status, message=None):
     os.replace(tmp, meta)
 
 
-def read_status(mp3):
+def read_status_metadata(mp3):
     meta = mp3.with_suffix(".json")
     if not meta.is_file():
-        return None
+        return {}
     try:
-        return json.loads(meta.read_text(encoding="utf-8")).get("status")
+        data = json.loads(meta.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
-        return None
+        return {}
+
+
+def read_status(mp3):
+    return read_status_metadata(mp3).get("status")
 
 
 def transcribe_file(mp3):
@@ -167,7 +177,13 @@ def process_batch():
     for mp3 in RECORDINGS_DIR.rglob("*.mp3"):
         if mp3.with_suffix(".txt").exists():
             continue
-        if read_status(mp3) in FINAL_STATUSES:
+        status_meta = read_status_metadata(mp3)
+        status = status_meta.get("status")
+        if status in FINAL_STATUSES:
+            old_no_speech = status == "no_speech" and status_meta.get("status_version") != STATUS_VERSION
+            if not old_no_speech:
+                continue
+            logger.info("retrying legacy no-speech recording: %s", mp3.name)
             continue
         try:
             st = mp3.stat()
