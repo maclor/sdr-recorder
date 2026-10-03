@@ -6,7 +6,7 @@ Trzy kontenery Dockera:
 
 - **recorder** — łączy się z OpenWebRX po WebSocket (jak przeglądarka), odbiera zdemodulowane audio + poziom sygnału (S-metr), sam wykrywa „ktoś nadaje" i zapisuje MP3.
 - **transcriber** — transkrybuje nagrania (whisper.cpp, model `base Q5`, polski) starsze niż 5 min, zapisuje `.txt` ze znacznikami `[GG:MM:SS]`.
-- **web** — serwuje stronę z listą nagrań, odtwarzaczem, przyciskiem „Usuń" oraz rozwijaną transkrypcją (port 8074).
+- **web** — serwuje stronę z listą nagrań, odtwarzaczem, przyciskiem „Usuń", rozwijaną transkrypcją oraz bocznym panelem ze scaloną transkrypcją wszystkich nagrań (znaczniki czasu i rozpoznana mowa; port 8074).
 
 ## Jak działa
 

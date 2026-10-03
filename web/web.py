@@ -164,6 +164,24 @@ def list_recordings():
     return recordings
 
 
+def merged_transcript():
+    """Return all available transcripts in the same newest-first order as recordings."""
+    chunks = []
+    if not RECORDINGS_DIR.is_dir():
+        return ""
+    for mp3 in sorted(RECORDINGS_DIR.rglob("*.mp3"), reverse=True):
+        txt = mp3.with_suffix(".txt")
+        if not txt.is_file():
+            continue
+        try:
+            text = txt.read_text(encoding="utf-8").lstrip("\ufeff").strip()
+        except OSError:
+            continue
+        if text:
+            chunks.append(text)
+    return "\n".join(chunks)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "sdr-recorder-web"
@@ -195,6 +213,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._serve_index()
         if path == "/api/recordings":
             return self._send_json({"recordings": list_recordings()})
+        if path == "/api/transcripts":
+            return self._send_json({"transcript": merged_transcript()})
         if path.startswith("/api/transcript/"):
             return self._serve_transcript(path[len("/api/transcript/"):])
         if path.startswith("/recordings/"):
@@ -364,6 +384,8 @@ INDEX_HTML = """<!DOCTYPE html>
 <style>
   body { font-family: system-ui, sans-serif; margin: 1.5rem; color: #222; }
   h1 { font-size: 1.3rem; }
+  .page-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(320px, 420px); gap: 1.25rem; align-items: start; }
+  .recordings-panel { min-width: 0; }
   table { border-collapse: collapse; width: 100%; }
   th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #eee; }
   th { font-size: 0.85rem; color: #666; }
@@ -378,6 +400,19 @@ INDEX_HTML = """<!DOCTYPE html>
   pre.transcript { margin: 0; white-space: pre-wrap; font-family: monospace; font-size: 0.9rem; color: #333; }
   td.status { font-size: 1rem; text-align: center; white-space: nowrap; }
   td.status .spinner { display: inline-block; animation: spin 1.2s linear infinite; }
+  .transcript-panel { position: sticky; top: 1rem; max-height: calc(100vh - 3rem); min-height: 300px; display: flex; flex-direction: column; overflow: hidden; border: 1px solid #ddd; border-radius: 6px; background: #fafafa; }
+  .transcript-panel-header { padding: 12px 14px; border-bottom: 1px solid #ddd; background: #fff; }
+  .transcript-panel-header h2 { margin: 0; font-size: 1.05rem; }
+  .transcript-content { overflow: auto; padding: 6px 14px; }
+  .transcript-line { display: grid; grid-template-columns: auto 1fr; gap: 12px; padding: 9px 0; border-bottom: 1px solid #e8e8e8; line-height: 1.4; }
+  .transcript-line:last-child { border-bottom: 0; }
+  .transcript-time { color: #666; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 0.82rem; white-space: nowrap; }
+  .transcript-speech { min-width: 0; color: #222; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .transcript-placeholder { margin: 1rem 0; color: #888; font-size: 0.9rem; }
+  @media (max-width: 900px) {
+    .page-layout { grid-template-columns: 1fr; }
+    .transcript-panel { position: static; max-height: none; }
+  }
   @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 </style>
 </head>
@@ -387,14 +422,28 @@ INDEX_HTML = """<!DOCTYPE html>
   <button id="refresh" style="border-color:#666;color:#666;">Odśwież</button>
   <button id="delete-all" style="border-color:#666;color:#666;">Usuń wszystkie</button>
 </div>
-<table id="table">
-  <thead><tr><th>Data i godzina</th><th>Odsłuch</th><th>Długość</th><th>Transkrypcja</th><th></th></tr></thead>
-  <tbody id="rows"></tbody>
-</table>
-<div id="empty" class="empty" style="display:none">Brak nagrań.</div>
+<div class="page-layout">
+  <main class="recordings-panel">
+    <table id="table">
+      <thead><tr><th>Data i godzina</th><th>Odsłuch</th><th>Długość</th><th>Transkrypcja</th><th></th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div id="empty" class="empty" style="display:none">Brak nagrań.</div>
+  </main>
+
+  <aside class="transcript-panel" aria-label="Transkrypcja wszystkich nagrań">
+    <div class="transcript-panel-header">
+      <h2>Transkrypcja wszystkich nagrań</h2>
+    </div>
+    <div id="transcript-content" class="transcript-content">
+      <p class="transcript-placeholder">Wczytywanie transkrypcji…</p>
+    </div>
+  </aside>
+</div>
 
 <script>
 const transcriptCache = {};
+const transcriptRequests = {};
 
 const STATUS_ICONS = {
   pending:     { icon: "⏳", color: "#999", title: "oczekuje na transkrypcję" },
@@ -424,20 +473,7 @@ async function toggleTranscript(path, tr) {
     row.remove();
     return;
   }
-  let text = transcriptCache[path];
-  if (text === undefined) {
-    text = null;
-    try {
-      const res = await fetch("/api/transcript/" + path.split("/").map(encodeURIComponent).join("/"));
-      if (res.ok) {
-        const data = await res.json();
-        text = data.transcript || "";
-      }
-    } catch (e) {
-      text = null;
-    }
-    transcriptCache[path] = text;
-  }
+  const text = await getTranscript(path);
   const tr2 = document.createElement("tr");
   tr2.className = "transcript-row";
   const td = document.createElement("td");
@@ -453,6 +489,95 @@ async function toggleTranscript(path, tr) {
   }
   tr2.appendChild(td);
   tr.after(tr2);
+}
+
+async function getTranscript(path) {
+  let text = transcriptCache[path];
+  if (text !== undefined) return text;
+  if (transcriptRequests[path]) return transcriptRequests[path];
+
+  transcriptRequests[path] = (async function() {
+    let result = null;
+    try {
+      const res = await fetch("/api/transcript/" + path.split("/").map(encodeURIComponent).join("/"));
+      if (res.ok) {
+        const data = await res.json();
+        result = data.transcript || "";
+      }
+    } catch (e) {
+      result = null;
+    }
+    transcriptCache[path] = result;
+    delete transcriptRequests[path];
+    return result;
+  })();
+  return transcriptRequests[path];
+}
+
+function parseTranscript(text) {
+  return text.split(/\\r?\\n/).map(function(line) {
+    const match = line.match(/^\[\s*(\d{1,2}:\d{2}:\d{2})\s*\]\s*(.*)$/);
+    return match ? { time: match[1], speech: match[2] } : null;
+  }).filter(function(line) {
+    return line && line.speech;
+  });
+}
+
+function renderTranscript(text) {
+  const content = document.getElementById("transcript-content");
+  content.innerHTML = "";
+  if (!text) {
+    const empty = document.createElement("p");
+    empty.className = "transcript-placeholder";
+    empty.textContent = "Brak transkrypcji.";
+    content.appendChild(empty);
+    return;
+  }
+
+  const lines = parseTranscript(text);
+  if (!lines.length) {
+    const empty = document.createElement("p");
+    empty.className = "transcript-placeholder";
+    empty.textContent = "Brak rozpoznanych fragmentów mowy.";
+    content.appendChild(empty);
+    return;
+  }
+
+  for (const line of lines) {
+    const item = document.createElement("div");
+    item.className = "transcript-line";
+    const time = document.createElement("span");
+    time.className = "transcript-time";
+    time.textContent = line.time;
+    const speech = document.createElement("span");
+    speech.className = "transcript-speech";
+    speech.textContent = line.speech;
+    item.appendChild(time);
+    item.appendChild(speech);
+    content.appendChild(item);
+  }
+}
+
+async function loadMergedTranscript() {
+  const content = document.getElementById("transcript-content");
+  content.innerHTML = "";
+  const loading = document.createElement("p");
+  loading.className = "transcript-placeholder";
+  loading.textContent = "Wczytywanie transkrypcji…";
+  content.appendChild(loading);
+
+  try {
+    const res = await fetch("/api/transcripts?_=" + Date.now());
+    if (!res.ok) throw new Error("transcript request failed");
+    const data = await res.json();
+    renderTranscript(data.transcript || "");
+  } catch (e) {
+    content.innerHTML = "";
+    const error = document.createElement("p");
+    error.className = "transcript-placeholder";
+    error.textContent = "Nie udało się wczytać transkrypcji.";
+    content.appendChild(error);
+  }
 }
 
 async function load() {
@@ -482,7 +607,9 @@ async function load() {
     btnT.textContent = "Transkrypcja";
     btnT.className = "secondary";
     btnT.style.marginRight = "6px";
-    btnT.onclick = function() { toggleTranscript(r.path, tr); };
+    btnT.onclick = function() {
+      toggleTranscript(r.path, tr);
+    };
     const btn = document.createElement("button");
     btn.textContent = "Usuń";
     btn.onclick = async function() {
@@ -499,6 +626,7 @@ async function load() {
     tr.appendChild(tdDel);
     rows.appendChild(tr);
   }
+  loadMergedTranscript();
 }
 load();
 document.getElementById("refresh").onclick = function() { load(); };
