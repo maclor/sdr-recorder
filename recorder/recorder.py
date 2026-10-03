@@ -24,7 +24,7 @@ END_SILENCE_SECONDS = float(os.environ.get("END_SILENCE_SECONDS", "3"))
 MIN_DURATION_SECONDS = float(os.environ.get("MIN_DURATION_SECONDS", "1"))
 MAX_RECORDING_SECONDS = float(os.environ.get("MAX_RECORDING_SECONDS", "600"))
 NOISE_WINDOW_SECONDS = float(os.environ.get("NOISE_WINDOW_SECONDS", "600"))
-MP3_BITRATE = int(os.environ.get("MP3_BITRATE", "32"))
+MP3_BITRATE = int(os.environ.get("MP3_BITRATE", "48"))
 RECORDINGS_DIR = Path(os.environ.get("RECORDINGS_DIR", "/recordings"))
 OPENWEBRX_WS_URL = os.environ.get("OPENWEBRX_WS_URL", "ws://192.168.68.67:8073/ws/")
 
@@ -39,14 +39,16 @@ def env_bool(name, default=True):
 # Recordings are first kept under a non-MP3 suffix.  This means that the web
 # service and the transcriber cannot see a file while it is being denoised.
 DENOISE_ENABLED = env_bool("DENOISE_ENABLED")
-DENOISE_BACKEND = os.environ.get("DENOISE_BACKEND", "deepfilternet").strip().lower()
-DENOISE_NR = float(os.environ.get("DENOISE_NR", "12"))
-DENOISE_NOISE_FLOOR_DB = float(os.environ.get("DENOISE_NOISE_FLOOR_DB", "-45"))
-DENOISE_SILENCE_DB = float(os.environ.get("DENOISE_SILENCE_DB", "-42"))
-DENOISE_MIN_SIGNAL_SECONDS = float(os.environ.get("DENOISE_MIN_SIGNAL_SECONDS", "0.5"))
+DENOISE_BACKEND = os.environ.get("DENOISE_BACKEND", "afftdn").strip().lower()
+# SDR audio is narrow-band.  A conservative spectral filter preserves speech
+# much better than a speech model trained on full-band microphone recordings.
+DENOISE_NR = float(os.environ.get("DENOISE_NR", "8"))
+DENOISE_NOISE_FLOOR_DB = float(os.environ.get("DENOISE_NOISE_FLOOR_DB", "-40"))
+DENOISE_SILENCE_DB = float(os.environ.get("DENOISE_SILENCE_DB", "-45"))
+DENOISE_MIN_SIGNAL_SECONDS = float(os.environ.get("DENOISE_MIN_SIGNAL_SECONDS", "0.25"))
 DEEPFILTER_BIN = os.environ.get("DEEPFILTER_BIN", "deep-filter")
-DEEPFILTER_POST_FILTER = env_bool("DEEPFILTER_POST_FILTER")
-DEEPFILTER_COMPENSATE_DELAY = env_bool("DEEPFILTER_COMPENSATE_DELAY")
+DEEPFILTER_POST_FILTER = env_bool("DEEPFILTER_POST_FILTER", False)
+DEEPFILTER_COMPENSATE_DELAY = env_bool("DEEPFILTER_COMPENSATE_DELAY", True)
 
 INDEX_TABLE = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8]
 STEP_TABLE = [
@@ -172,6 +174,10 @@ class Recorder:
         self.rec_final_file = None
         self.rec_start = None
         self.postprocess_tasks = set()
+        # DeepFilterNet is CPU-heavy on the target machine.  Serializing the
+        # post-processing also prevents several ffmpeg/model instances from
+        # starving the receiver and producing incomplete output files.
+        self.postprocess_semaphore = asyncio.Semaphore(1)
 
     async def run(self):
         while self._running:
@@ -419,24 +425,27 @@ class Recorder:
             return
         stem = now.strftime("%Y-%m-%d_%H-%M-%S")
         final_path = day_dir / (stem + ".mp3")
-        path = final_path.with_name(final_path.name + ".part")
+        # Keep the source lossless until noise reduction has completed.  The
+        # old pipeline encoded to 32 kbps MP3 first and then fed that lossy
+        # audio to the denoiser, which made consonants especially fragile.
+        path = final_path.with_name(final_path.name + ".part.wav")
         i = 1
         while final_path.exists() or path.exists():
             final_path = day_dir / ("%s_%d.mp3" % (stem, i))
-            path = final_path.with_name(final_path.name + ".part")
+            path = final_path.with_name(final_path.name + ".part.wav")
             i += 1
         cmd = [
             "ffmpeg", "-loglevel", "error", "-y",
             "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1", "-i", "-",
-            "-ar", "32000", "-ac", "1", "-c:a", "libmp3lame", "-b:a", str(MP3_BITRATE) + "k",
-            "-f", "mp3", str(path),
+            "-ar", str(SAMPLE_RATE), "-ac", "1", "-c:a", "pcm_s16le",
+            "-f", "wav", str(path),
         ]
         try:
             proc = subprocess.Popen(
                 cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
         except OSError as e:
-            logger.error("failed to start lame: %s", e)
+            logger.error("failed to start ffmpeg: %s", e)
             return
         self.lame = proc
         self.rec_file = path
@@ -496,9 +505,13 @@ class Recorder:
             self._postprocess_recording(path, final_path, duration)
             return
 
-        task = loop.create_task(asyncio.to_thread(
-            self._postprocess_recording, path, final_path, duration
-        ))
+        async def process_one():
+            async with self.postprocess_semaphore:
+                await asyncio.to_thread(
+                    self._postprocess_recording, path, final_path, duration
+                )
+
+        task = loop.create_task(process_one())
         self.postprocess_tasks.add(task)
         task.add_done_callback(self.postprocess_tasks.discard)
 
@@ -527,9 +540,9 @@ class Recorder:
             path.unlink(missing_ok=True)
             logger.info("published denoised recording (%.1fs): %s", duration, final_path)
         except Exception:
-            # Keep the pending source for diagnostics/retry.  Its .part suffix
-            # deliberately keeps it out of the public recording and scanning
-            # glob patterns.
+            # Keep the pending source for diagnostics/retry.  Its .part.wav
+            # suffix deliberately keeps it out of the public recording and
+            # scanning glob patterns.
             processed_path.unlink(missing_ok=True)
             logger.exception("could not denoise recording; kept pending file: %s", path)
         finally:
@@ -539,9 +552,9 @@ class Recorder:
     def _enhance_audio(self, path, processed_path):
         """Return a denoised WAV/MP3 path which is still private to recorder."""
         if not DENOISE_ENABLED:
-            # Still run the signal test when denoising is explicitly disabled;
-            # this keeps the publication rule predictable.
-            os.replace(path, processed_path)
+            # The private source is now WAV, so it must still be encoded to the
+            # public MP3 even when noise reduction is disabled.
+            self._encode_mp3(path, processed_path)
             return processed_path
 
         if DENOISE_BACKEND == "deepfilternet":
@@ -658,19 +671,80 @@ class Recorder:
             raise RuntimeError(detail[-1] if detail else "silence detection failed")
 
         output = detect.stderr or ""
-        starts = re.findall(r"silence_start:\s*([-+]?\d+(?:\.\d+)?)", output)
-        ends = re.findall(r"silence_end:\s*([-+]?\d+(?:\.\d+)?)", output)
-        if not starts:
+        duration_match = re.search(
+            r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", output
+        )
+        if not duration_match:
+            # Do not remove a file merely because a future ffmpeg version
+            # changes the informational header format.  The processing error
+            # path is deliberately conservative about deleting user audio.
             return True
 
-        # A file which starts with silence and never reports its end is silent
-        # from beginning to end.  Any silence_end means that audio rose above
-        # the post-denoise threshold for long enough to count as a signal.
-        try:
-            starts_at_beginning = float(starts[0]) <= 0.05
-        except ValueError:
-            starts_at_beginning = False
-        return not starts_at_beginning or bool(ends)
+        hours, minutes, seconds = duration_match.groups()
+        media_duration = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+        min_signal = max(DENOISE_MIN_SIGNAL_SECONDS, 0.05)
+        if media_duration < min_signal:
+            return False
+
+        # silencedetect only emits intervals which are at least d seconds
+        # long.  Walk the intervals instead of merely looking for a
+        # silence_end: the old implementation accepted a file containing a
+        # short noise click at t=0 as a valid recording.
+        events = []
+        for value in re.findall(r"silence_start:\s*([-+]?\d+(?:\.\d+)?)", output):
+            events.append((float(value), "start"))
+        for value in re.findall(r"silence_end:\s*([-+]?\d+(?:\.\d+)?)", output):
+            events.append((float(value), "end"))
+        events.sort(key=lambda item: item[0])
+
+        cursor = 0.0
+        in_silence = False
+        longest_signal = 0.0
+        for timestamp, kind in events:
+            timestamp = max(0.0, min(timestamp, media_duration))
+            if kind == "start":
+                if not in_silence:
+                    longest_signal = max(longest_signal, timestamp - cursor)
+                in_silence = True
+            elif in_silence:
+                cursor = timestamp
+                in_silence = False
+
+        if not in_silence:
+            longest_signal = max(longest_signal, media_duration - cursor)
+        return longest_signal >= min_signal
+
+    @staticmethod
+    def _delete_recording_and_sidecars(mp3):
+        """Remove a recording and metadata which would otherwise be orphaned."""
+        mp3.unlink(missing_ok=True)
+        for suffix in (".txt", ".json"):
+            mp3.with_suffix(suffix).unlink(missing_ok=True)
+
+    def cleanup_empty_recordings(self):
+        """Remove already-published files which contain no useful audio.
+
+        This runs once before connecting to OpenWebRX.  New recordings are
+        checked before publication in _postprocess_recording; this pass also
+        cleans files produced by the previous, overly aggressive pipeline.
+        """
+        if not RECORDINGS_DIR.is_dir():
+            return
+        removed = 0
+        for mp3 in RECORDINGS_DIR.rglob("*.mp3"):
+            try:
+                if not self._has_signal_after_denoise(mp3):
+                    self._delete_recording_and_sidecars(mp3)
+                    removed += 1
+                    logger.info("removed empty recording: %s", mp3)
+            except OSError:
+                logger.exception("could not remove empty recording: %s", mp3)
+            except Exception:
+                # A malformed or unreadable file should remain available for
+                # manual inspection rather than being deleted automatically.
+                logger.exception("could not inspect recording: %s", mp3)
+        if removed:
+            logger.info("removed %d empty recording(s)", removed)
 
     async def wait_for_postprocessing(self):
         if self.postprocess_tasks:
@@ -699,6 +773,9 @@ async def main():
         logger.warning("multiple frequencies configured; recording only the first (%s)", freq)
 
     recorder = Recorder(OPENWEBRX_WS_URL, freq, mod)
+    # Remove silent MP3s left by older versions before the web service can
+    # expose them again.  The pass is independent of the receiver session.
+    await asyncio.to_thread(recorder.cleanup_empty_recordings)
     task = asyncio.create_task(recorder.run())
     await stop_event.wait()
     logger.info("shutting down")

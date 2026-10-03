@@ -13,7 +13,7 @@ Trzy kontenery Dockera:
 1. `recorder` loguje się do OpenWebRX jako headless klient `receiver`, wybiera profil SDR pokrywający docelową częstotliwość i ustawia demodulację (domyślnie NFM).
 2. Squelch serwera jest wyłączony (ustawiony na otwarty) — bramkowanie robi sam rejestrator na podstawie **S-metra** i **energii audio**. Poziom szumu jest liczony jako **przesuwne minimum z ostatnich `NOISE_WINDOW_SECONDS`** (śledzi zmiany szumu w ciągu dnia), a próg otwarcia to `SQUELCH_MARGIN`/`RMS_MARGIN` dB ponad tym minimum. Dzięki temu działa **bufer pre-roll** (początek transmisji nie jest ucięty), sam szum nie jest nagrywany, a ciągła nośna/interferencja po chwili przestaje być rejestrowana.
 3. Gdy pojawia się sygnał, rejestrator najpierw zapisuje bufor pre-roll (dźwięk sprzed wykrycia), potem strumień; kończy nagranie po `END_SILENCE_SECONDS` ciszy (twardy limit `MAX_RECORDING_SECONDS`).
-4. Zamknięty plik trafia najpierw do prywatnego pliku tymczasowego. Rejestrator przepuszcza go przez DeepFilterNet3 (CPU-only), sprawdza `silencedetect` i usuwa pliki, w których po odszumieniu nie został sygnał. Dopiero po pozytywnym wyniku atomowo publikuje MP3 w `recordings/YYYY-MM-DD/YYYY-MM-DD_HH-MM-SS.mp3`.
+4. Zamknięty plik trafia najpierw do prywatnego, bezstratnego WAV-a. Rejestrator odszumia go łagodnym `afftdn` (lepiej dopasowanym do wąskopasmowego NFM; DeepFilterNet3 można włączyć opcjonalnie), sprawdza, czy został użyteczny fragment dźwięku, i usuwa puste pliki. Dopiero po pozytywnym wyniku atomowo publikuje MP3 w `recordings/YYYY-MM-DD/YYYY-MM-DD_HH-MM-SS.mp3`. Przy starcie czyści także puste nagrania pozostawione przez starszą wersję.
 5. `transcriber` co ~1 min przeszukuje opublikowane nagrania starsze niż `MIN_AGE_SECONDS`, transkrybuje je (whisper.cpp, base Q5) i zapisuje obok pliku `.txt` w formacie `[GG:MM:SS] tekst` (oraz `.json` ze statusem).
 
 ## Uruchomienie
@@ -102,18 +102,18 @@ Wszystko poniżej ustawia się w `.env`, a `docker-compose.yml` czyta to przez `
 | `PRE_ROLL_SECONDS` | `2` | długość bufora początku nadawania |
 | `END_SILENCE_SECONDS` | `3` | czas ciszy kończący nagranie |
 | `MIN_DURATION_SECONDS` | `1` | odrzucanie krótszych nagrań |
-| `MP3_BITRATE` | `32` | bitrate MP3 (kbps) |
+| `MP3_BITRATE` | `48` | bitrate MP3 (kbps) |
 | `OUTPUT_RATE` | `12000` | częstotliwość próbkowania audio |
 | `RECORDINGS_DIR` | `./recordings` | katalog nagrań **na hoście** (w kontenerze zawsze `/recordings`) |
 | `WEB_PORT` | `8074` | port strony odsłuchu **na hoście** (w kontenerze zawsze `8074`) |
 | `DENOISE_ENABLED` | `1` | odszumianie po nagraniu i test sygnału |
-| `DENOISE_BACKEND` | `deepfilternet` | backend: DeepFilterNet3 albo `afftdn` jako lżejsza alternatywa |
-| `DENOISE_NR` | `12` | siła `afftdn` (używana tylko przy backendzie `afftdn`) |
-| `DENOISE_NOISE_FLOOR_DB` | `-45` | zakładany poziom szumu dla `afftdn` |
-| `DEEPFILTER_POST_FILTER` | `1` | dodatkowe tłumienie trudnych fragmentów w DeepFilterNet |
+| `DENOISE_BACKEND` | `afftdn` | backend: łagodny filtr dla NFM; `deepfilternet` jako opcja |
+| `DENOISE_NR` | `8` | siła `afftdn` (używana tylko przy backendzie `afftdn`) |
+| `DENOISE_NOISE_FLOOR_DB` | `-40` | zakładany poziom szumu dla `afftdn` |
+| `DEEPFILTER_POST_FILTER` | `0` | dodatkowe tłumienie trudnych fragmentów w DeepFilterNet; domyślnie wyłączone, bo może ucinać mowę |
 | `DEEPFILTER_COMPENSATE_DELAY` | `1` | kompensata opóźnienia STFT/modelu |
-| `DENOISE_SILENCE_DB` | `-42` | próg uznania fragmentu za sygnał po odszumieniu |
-| `DENOISE_MIN_SIGNAL_SECONDS` | `0.5` | minimalna długość fragmentu powyżej progu |
+| `DENOISE_SILENCE_DB` | `-45` | próg uznania fragmentu za sygnał po odszumieniu |
+| `DENOISE_MIN_SIGNAL_SECONDS` | `0.25` | minimalna długość fragmentu powyżej progu |
 | `TZ` | `Europe/Warsaw` | strefa czasowa nazw plików |
 
 ### Transkryber
